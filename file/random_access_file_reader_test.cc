@@ -523,6 +523,131 @@ TEST_F(RandomAccessFileReaderTest, MultiReadDirectIOUsesExternalBuffer) {
   }
 }
 
+TEST(AlignAndMergeReadsTest, MergeGapAndBufferLayout) {
+  constexpr size_t kAlign = 4096;
+
+  // Three blocks: two in the first page (their aligned intervals overlap and
+  // merge), one in the third page (a gap keeps it a separate request).
+  FSReadRequest r0;
+  r0.offset = 0;
+  r0.len = kAlign / 4;
+  r0.scratch = nullptr;
+
+  FSReadRequest r1;
+  r1.offset = kAlign / 2;
+  r1.len = kAlign / 2;
+  r1.scratch = nullptr;
+
+  FSReadRequest r2;
+  r2.offset = 2 * kAlign + kAlign / 4;
+  r2.len = kAlign / 2;
+  r2.scratch = nullptr;
+
+  std::vector<FSReadRequest> reqs;
+  reqs.push_back(std::move(r0));
+  reqs.push_back(std::move(r1));
+  reqs.push_back(std::move(r2));
+
+  AlignedBuffer buffer;
+  AlignedBufferAllocationContext ctx{&buffer};
+  std::vector<FSReadRequest> aligned;
+  ASSERT_OK(AlignAndMergeReads(reqs.data(), reqs.size(), kAlign, &ctx,
+                               &aligned));
+
+  ASSERT_EQ(aligned.size(), 2);
+  EXPECT_EQ(aligned[0].offset, 0);
+  EXPECT_EQ(aligned[0].len, kAlign);
+  EXPECT_EQ(aligned[1].offset, 2 * kAlign);
+  EXPECT_EQ(aligned[1].len, kAlign);
+
+  // One backing buffer for the whole batch, scratches laid out contiguously.
+  ASSERT_NE(buffer.BufferStart(), nullptr);
+  ASSERT_GE(buffer.Capacity(), 2 * kAlign);
+  EXPECT_EQ(aligned[0].scratch, buffer.BufferStart());
+  EXPECT_EQ(aligned[1].scratch, buffer.BufferStart() + kAlign);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(buffer.BufferStart()) % kAlign, 0);
+}
+
+TEST(PopulateUnalignedResultsTest, DemuxSubSlicesAndPerRequestFailure) {
+  constexpr size_t kAlign = 4096;
+  std::string backing(2 * kAlign, '\0');
+  for (size_t i = 0; i < backing.size(); ++i) {
+    backing[i] = static_cast<char>('a' + i % 26);
+  }
+
+  // Aligned request 0 covers originals 0 and 1; aligned request 1 covers
+  // original 2 and failed.
+  std::vector<FSReadRequest> aligned(2);
+  aligned[0].offset = 0;
+  aligned[0].len = kAlign;
+  aligned[0].scratch = backing.data();
+  aligned[0].status = IOStatus::OK();
+  aligned[0].result = Slice(aligned[0].scratch, kAlign);
+  aligned[1].offset = 2 * kAlign;
+  aligned[1].len = kAlign;
+  aligned[1].scratch = backing.data() + kAlign;
+  aligned[1].status = IOStatus::IOError("injected");
+  aligned[1].result = Slice();
+
+  std::vector<FSReadRequest> reqs(3);
+  reqs[0].offset = 0;
+  reqs[0].len = kAlign / 4;
+  reqs[1].offset = kAlign / 2;
+  reqs[1].len = kAlign / 2;
+  reqs[2].offset = 2 * kAlign + kAlign / 4;
+  reqs[2].len = kAlign / 2;
+
+  PopulateUnalignedResults(reqs.data(), reqs.size(), aligned.data(),
+                           aligned.size());
+
+  ASSERT_OK(reqs[0].status);
+  EXPECT_EQ(reqs[0].result.data(), aligned[0].scratch);
+  EXPECT_EQ(reqs[0].result.size(), kAlign / 4);
+  ASSERT_OK(reqs[1].status);
+  EXPECT_EQ(reqs[1].result.data(), aligned[0].scratch + kAlign / 2);
+  EXPECT_EQ(reqs[1].result.size(), kAlign / 2);
+  // The failure poisons only the requests covered by the failed aligned
+  // request.
+  EXPECT_TRUE(reqs[2].status.IsIOError());
+  EXPECT_TRUE(reqs[2].result.empty());
+  aligned[1].status.PermitUncheckedError();
+}
+
+TEST(PopulateUnalignedResultsTest, DemuxShortRead) {
+  constexpr size_t kAlign = 4096;
+  std::string backing(kAlign, 'x');
+
+  // The aligned read came back short (e.g. EOF in a direct IO read): only the
+  // first half page was returned.
+  std::vector<FSReadRequest> aligned(1);
+  aligned[0].offset = 0;
+  aligned[0].len = kAlign;
+  aligned[0].scratch = backing.data();
+  aligned[0].status = IOStatus::OK();
+  aligned[0].result = Slice(aligned[0].scratch, kAlign / 2);
+
+  std::vector<FSReadRequest> reqs(3);
+  // Entirely within the returned bytes.
+  reqs[0].offset = 0;
+  reqs[0].len = kAlign / 4;
+  // Straddles the end of the returned bytes: truncated.
+  reqs[1].offset = kAlign / 4;
+  reqs[1].len = kAlign / 2;
+  // Entirely past the returned bytes: empty.
+  reqs[2].offset = kAlign / 2;
+  reqs[2].len = kAlign / 4;
+
+  PopulateUnalignedResults(reqs.data(), reqs.size(), aligned.data(),
+                           aligned.size());
+
+  ASSERT_OK(reqs[0].status);
+  EXPECT_EQ(reqs[0].result.size(), kAlign / 4);
+  ASSERT_OK(reqs[1].status);
+  EXPECT_EQ(reqs[1].result.size(), kAlign / 4);
+  ASSERT_OK(reqs[2].status);
+  EXPECT_TRUE(reqs[2].result.empty());
+}
+
 // Regression test for a direct-IO async-read buffer bug. When a caller submits
 // an already-aligned FSReadRequest with a null scratch and provides an
 // `aligned_buf` out-parameter for the reader to allocate the backing buffer

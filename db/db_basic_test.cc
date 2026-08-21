@@ -3876,12 +3876,14 @@ INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
 #if USE_COROUTINES
 class DBMultiGetAsyncIOTest
     : public DBBasicTest,
-      public ::testing::WithParamInterface<std::tuple<bool, bool>> {
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
  public:
   DBMultiGetAsyncIOTest()
       : DBBasicTest(),
         optimize_multiget_for_io_(std::get<0>(GetParam())),
         use_coroutine_(std::get<1>(GetParam())),
+        use_direct_io_(std::get<2>(GetParam()) &&
+                       test::IsDirectIOSupported(Env::Default(), dbname_)),
         statistics_(ROCKSDB_NAMESPACE::CreateDBStatistics()) {
     BlockBasedTableOptions bbto;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10));
@@ -3890,6 +3892,11 @@ class DBMultiGetAsyncIOTest
     options_.statistics = statistics_;
     options_.table_factory.reset(NewBlockBasedTableFactory(bbto));
     options_.env = Env::Default();
+    // When the environment supports it, run the whole suite against direct IO
+    // as well: the async MultiGet IO expectations (batch sizes, coroutine
+    // counts) are the same as for buffered reads, since request merging only
+    // happens within a file's batch.
+    options_.use_direct_reads = use_direct_io_;
     Reopen(options_);
     int num_keys = 0;
 
@@ -3987,6 +3994,9 @@ class DBMultiGetAsyncIOTest
 
   const bool optimize_multiget_for_io_;
   const bool use_coroutine_;
+  // Whether direct IO was requested by the test parameter AND is supported by
+  // the environment; falls back to buffered reads otherwise.
+  const bool use_direct_io_;
 
  private:
   std::shared_ptr<Statistics> statistics_;
@@ -4270,8 +4280,55 @@ TEST_P(DBMultiGetAsyncIOTest, GetNoIOUring) {
   }
 }
 
+#ifdef ROCKSDB_IOURING_PRESENT
+TEST_P(DBMultiGetAsyncIOTest, DirectIOReadsStayAsync) {
+  if (!use_direct_io_) {
+    ROCKSDB_GTEST_BYPASS("Requires direct IO support in the environment");
+    return;
+  }
+  // GetNoIOUring leaves the process-wide io_uring switch off; this test needs
+  // it on (SupportedOps only advertises kAsyncIO with a working io_uring).
+  enable_io_uring = true;
+
+  // 3 keys in 3 separate L1 files: with direct IO the block requests must be
+  // aligned/merged up front and still fanned out through the async reader,
+  // not silently degraded to synchronous per-file MultiRead.
+  std::vector<std::string> key_strs{Key(33), Key(54), Key(102)};
+
+  PrepareDBForTest();
+
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
+  ASSERT_EQ(values.size(), 3);
+  ASSERT_EQ(values[0], "val_l1_" + std::to_string(33));
+  ASSERT_EQ(values[1], "val_l1_" + std::to_string(54));
+  ASSERT_EQ(values[2], "val_l1_" + std::to_string(102));
+
+  if (UseCoroutineRead()) {
+    // The coroutine read path submits aligned direct IO reads through
+    // SubmitReadAsync on the read executor; none may fall back to sync reads.
+    ASSERT_EQ(statistics()->getTickerCount(FILE_SUBMIT_ASYNC_READ_FALLBACK),
+              0);
+    ASSERT_GT(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 0);
+  } else {
+    // The async_io path submits aligned direct IO reads through ReadAsync +
+    // Poll; ASYNC_READ_BYTES is recorded per completed async read, and none
+    // of the submissions may have taken the synchronous Busy/NotSupported
+    // retry (which records FILE_SUBMIT_ASYNC_READ_FALLBACK).
+    HistogramData async_read_bytes;
+    statistics()->histogramData(ASYNC_READ_BYTES, &async_read_bytes);
+    ASSERT_GT(async_read_bytes.count, 0);
+    ASSERT_EQ(statistics()->getTickerCount(FILE_SUBMIT_ASYNC_READ_FALLBACK),
+              0);
+    AssertMultiGetIOBatchSize(1, 3);
+  }
+}
+#endif  // ROCKSDB_IOURING_PRESENT
+
 INSTANTIATE_TEST_CASE_P(DBMultiGetAsyncIOTest, DBMultiGetAsyncIOTest,
-                        testing::Combine(testing::Bool(), testing::Bool()));
+                        testing::Combine(testing::Bool(), testing::Bool(),
+                                         testing::Bool()));
 #endif  // USE_COROUTINES
 
 TEST_F(DBBasicTest, MultiGetStats) {

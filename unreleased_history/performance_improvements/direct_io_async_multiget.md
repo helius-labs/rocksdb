@@ -1,0 +1,1 @@
+In coroutine (`USE_COROUTINES`) builds, batched `MultiGet` with `ReadOptions::async_io` now reads data blocks from files opened with direct IO (`use_direct_reads`) through the asynchronous io_uring read path instead of falling back to synchronous per-file `MultiRead`, restoring cross-file IO parallelism under direct IO.

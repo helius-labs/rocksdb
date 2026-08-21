@@ -841,8 +841,41 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
         s = co_await file->MultiReadCoroutine(
             opts, &read_reqs[0], read_reqs.size(), &direct_io_context, &dbg);
       } else if (file->use_direct_io()) {
-        s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(),
-                            &direct_io_context, &dbg);
+        // AsyncFileReader submits each request's scratch straight to the
+        // FileSystem, so direct IO requests must be aligned up front: align
+        // and merge them into an aligned buffer, fan the aligned requests out
+        // through the AsyncFileReader so they are submitted alongside other
+        // files' reads and completed by a single Poll, then map the results
+        // back onto the original block requests. Aligned requests take the
+        // is_aligned fast path in RandomAccessFileReader::ReadAsync, so no
+        // synchronous fallback (which would break FileSystem::Poll) occurs.
+        std::vector<FSReadRequest> aligned_reqs;
+        s = AlignAndMergeReads(&read_reqs[0], read_reqs.size(),
+                               file->file()->GetRequiredBufferAlignment(),
+                               &direct_io_context, &aligned_reqs);
+        if (s.ok()) {
+          co_await batch->context()->reader().MultiReadAsync(
+              file, opts, aligned_reqs.data(), aligned_reqs.size(), &dbg);
+          for (FSReadRequest& aligned_req : aligned_reqs) {
+            if (aligned_req.status.IsBusy() ||
+                aligned_req.status.IsNotSupported()) {
+              // The async submission failed in a retriable way (the io_uring
+              // submission queue was full, or this thread could not
+              // initialize its ring). Fall back to a synchronous read of the
+              // already-aligned request, and count it so systematic
+              // degradation (e.g. a thread that can never initialize its
+              // ring) is visible in statistics.
+              RecordTick(rep_->ioptions.stats, FILE_SUBMIT_ASYNC_READ_FALLBACK,
+                         1);
+              aligned_req.status =
+                  file->Read(opts, aligned_req.offset, aligned_req.len,
+                             &aligned_req.result, aligned_req.scratch,
+                             /*direct_io_buffer_context=*/nullptr, &dbg);
+            }
+          }
+          PopulateUnalignedResults(&read_reqs[0], read_reqs.size(),
+                                   aligned_reqs.data(), aligned_reqs.size());
+        }
       } else {
         co_await batch->context()->reader().MultiReadAsync(
             file, opts, &read_reqs[0], read_reqs.size(), &dbg);
