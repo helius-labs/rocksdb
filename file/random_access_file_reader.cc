@@ -155,6 +155,93 @@ bool TryMerge(FSReadRequest* dest, const FSReadRequest& src) {
   return true;
 }
 
+IOStatus AlignAndMergeReads(const FSReadRequest* reqs, size_t num_reqs,
+                            size_t alignment,
+                            AlignedBufferAllocationContext* ctx,
+                            std::vector<FSReadRequest>* aligned_reqs) {
+  assert(reqs != nullptr);
+  assert(num_reqs > 0);
+  assert(ctx != nullptr && ctx->buffer != nullptr);
+  assert(aligned_reqs != nullptr && aligned_reqs->empty());
+#ifndef NDEBUG
+  for (size_t i = 0; i + 1 < num_reqs; ++i) {
+    assert(reqs[i].offset <= reqs[i + 1].offset);
+  }
+#endif  // !NDEBUG
+  // num_reqs is the max possible size,
+  // this can reduce std::vector's internal resize operations.
+  aligned_reqs->reserve(num_reqs);
+  // Align and merge the read requests.
+  for (size_t i = 0; i < num_reqs; i++) {
+    FSReadRequest r = Align(reqs[i], alignment);
+    if (i == 0) {
+      // head
+      aligned_reqs->push_back(std::move(r));
+
+    } else if (!TryMerge(&aligned_reqs->back(), r)) {
+      // head + n
+      aligned_reqs->push_back(std::move(r));
+
+    } else {
+      // unused
+      r.status.PermitUncheckedError();
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::MultiRead:AlignedReqs",
+                           aligned_reqs);
+
+  // Allocate one aligned buffer for the whole batch and let the aligned
+  // requests' scratch buffers point into it.
+  size_t total_len = 0;
+  for (const auto& r : *aligned_reqs) {
+    total_len += r.len;
+  }
+  ctx->buffer->Alignment(alignment);
+  Status allocate_status =
+      ctx->buffer->AllocateNewBuffer(total_len, ctx->allocator);
+  if (!allocate_status.ok()) {
+    return status_to_io_status(std::move(allocate_status));
+  }
+  char* scratch = ctx->buffer->BufferStart();
+  for (auto& r : *aligned_reqs) {
+    r.scratch = scratch;
+    scratch += r.len;
+  }
+  return IOStatus::OK();
+}
+
+void PopulateUnalignedResults(FSReadRequest* reqs, size_t num_reqs,
+                              const FSReadRequest* aligned_reqs,
+                              size_t num_aligned) {
+  assert(reqs != nullptr);
+  assert(aligned_reqs != nullptr);
+  assert(num_aligned > 0);
+  (void)num_aligned;
+  size_t aligned_i = 0;
+  for (size_t i = 0; i < num_reqs; i++) {
+    auto& r = reqs[i];
+    if (static_cast<size_t>(r.offset) > End(aligned_reqs[aligned_i])) {
+      aligned_i++;
+    }
+    assert(aligned_i < num_aligned);
+    const auto& fs_r = aligned_reqs[aligned_i];
+    r.status = fs_r.status;
+    if (r.status.ok()) {
+      uint64_t offset = r.offset - fs_r.offset;
+      if (fs_r.result.size() <= offset) {
+        // No byte in the read range is returned.
+        r.result = Slice();
+      } else {
+        size_t len =
+            std::min(r.len, static_cast<size_t>(fs_r.result.size() - offset));
+        r.result = Slice(fs_r.scratch + offset, len);
+      }
+    } else {
+      r.result = Slice();
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 // clang-format off

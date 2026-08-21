@@ -49,6 +49,26 @@ FSReadRequest Align(const FSReadRequest& r, size_t alignment);
 // Otherwise, do nothing and return false.
 bool TryMerge(FSReadRequest* dest, const FSReadRequest& src);
 
+// Prepare a batch of read requests for direct IO. Aligns each request
+// (see Align()), merges requests whose aligned intervals overlap (see
+// TryMerge()), allocates one aligned backing buffer for the whole batch via
+// `ctx`, and points each aligned request's scratch into it. `reqs` must be
+// sorted by offset and non-overlapping. On failure (buffer allocation),
+// returns the error and `aligned_reqs` must not be used.
+IOStatus AlignAndMergeReads(const FSReadRequest* reqs, size_t num_reqs,
+                            size_t alignment,
+                            AlignedBufferAllocationContext* ctx,
+                            std::vector<FSReadRequest>* aligned_reqs);
+
+// Demultiplex the results of a batch of aligned read requests produced by
+// AlignAndMergeReads() back into the original unaligned requests: each
+// original request gets the status of its covering aligned request and, on
+// success, a result slice into the aligned request's buffer (empty or
+// truncated if the aligned read came back short, e.g. at EOF).
+void PopulateUnalignedResults(FSReadRequest* reqs, size_t num_reqs,
+                              const FSReadRequest* aligned_reqs,
+                              size_t num_aligned);
+
 // RandomAccessFileReader is a wrapper on top of FSRandomAccessFile. It is
 // responsible for:
 // - Handling Buffered and Direct reads appropriately.
