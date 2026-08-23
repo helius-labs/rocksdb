@@ -96,11 +96,13 @@ struct KeyContext {
 //  }
 class MultiGetContext {
  public:
-  // Limit the number of keys in a batch to this number. Benchmarks show that
-  // there is negligible benefit for batches exceeding this. Keeping this < 32
-  // simplifies iteration, as well as reduces the amount of stack allocations
-  // that need to be performed
-  static const int MAX_BATCH_SIZE = 32;
+  // Limit the number of keys in a batch to this number. Upstream uses 32 (its
+  // benchmarks showed negligible benefit beyond that), but our archival
+  // multigets read thousands of contiguous keys per call, where the batch
+  // count sets the number of sequential coroutine IO rounds — 63 halves them.
+  // 63 is the ceiling for a 64-bit Mask: Mask{1} << MAX_BATCH_SIZE must be
+  // well defined (see static_assert below). Larger sizes need a wider Mask.
+  static const int MAX_BATCH_SIZE = 63;
 
   // A bitmask of at least MAX_BATCH_SIZE - 1 bits, so that
   // Mask{1} << MAX_BATCH_SIZE is well defined
