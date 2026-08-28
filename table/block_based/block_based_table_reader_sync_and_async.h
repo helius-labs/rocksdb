@@ -834,6 +834,12 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     IODebugContext dbg;
     IOStatus s = file->PrepareIOOptions(options, opts, &dbg);
     if (s.ok()) {
+      PERF_TIMER_GUARD(block_read_time);
+#if defined(WITHOUT_COROUTINES)
+      PERF_CPU_TIMER_GUARD(
+          block_read_cpu_time,
+          ioptions.env ? ioptions.env->GetSystemClock().get() : nullptr);
+#endif
 #if defined(WITH_COROUTINES)
       // RandomAccessFileReader handles direct IO alignment and delegates to the
       // file coroutine read path.

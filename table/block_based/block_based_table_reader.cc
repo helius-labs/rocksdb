@@ -2028,6 +2028,7 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::PutDataBlockToCache(
       uncompressed_block_contents.data.empty()) {
     assert(compressed_block_contents.data.data());
     // Retrieve the uncompressed contents into a new buffer
+    PERF_TIMER_GUARD(block_decompress_time);
     s = DecompressBlockData(
         compressed_block_contents.data.data(),
         compressed_block_contents.data.size(), block_comp_type, *decomp,
@@ -2242,6 +2243,7 @@ Status BlockBasedTable::CreateAndPinBlockInCache(
   if (out_parsed_block->GetValue() == nullptr && contents != nullptr) {
     BlockContents tmp_contents;
     if (compression_type != kNoCompression) {
+      PERF_TIMER_GUARD(block_decompress_time);
       s = DecompressSerializedBlock(contents->data.data(), handle.size(),
                                     compression_type, *decomp, &tmp_contents,
                                     rep_->ioptions,

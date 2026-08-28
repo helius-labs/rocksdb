@@ -4695,6 +4695,70 @@ TEST_F(DBBasicTest, MultiGetIOBufferOverrun) {
                      keys.data(), values.data(), statuses.data(), true);
 }
 
+TEST_F(DBBasicTest, MultiGetBlockReadAndDecompressPerfContext) {
+  // Batched MultiGet reads and decompresses data blocks in
+  // RetrieveMultipleBlocks rather than through BlockFetcher, so make sure it
+  // accounts block_read_time and block_decompress_time the same way Get does,
+  // both when filling the block cache and when bypassing it.
+  CompressionType compression = kNoCompression;
+  for (CompressionType type : GetSupportedCompressions()) {
+    if (type != kNoCompression) {
+      compression = type;
+      break;
+    }
+  }
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No compression library available");
+    return;
+  }
+
+  constexpr int kNumKeys = 8;
+  for (bool no_block_cache : {false, true}) {
+    Options options = CurrentOptions();
+    options.compression = compression;
+    options.disable_auto_compactions = true;
+    BlockBasedTableOptions table_options;
+    // One data block per key so a single MultiGet fetches several blocks.
+    table_options.block_size = 1;
+    table_options.no_block_cache = no_block_cache;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    std::vector<std::string> key_strs;
+    std::vector<std::string> value_strs;
+    for (int i = 0; i < kNumKeys; ++i) {
+      key_strs.push_back("key" + std::to_string(i));
+      // Highly compressible so the block is actually stored compressed.
+      value_strs.push_back(std::string(1000, static_cast<char>('a' + i)));
+      ASSERT_OK(Put(key_strs.back(), value_strs.back()));
+    }
+    ASSERT_OK(Flush());
+
+    std::vector<Slice> keys;
+    for (const std::string& k : key_strs) {
+      keys.emplace_back(k);
+    }
+    std::vector<PinnableSlice> values(kNumKeys);
+    std::vector<Status> statuses(kNumKeys);
+
+    SetPerfLevel(PerfLevel::kEnableTime);
+    get_perf_context()->Reset();
+    ReadOptions ro;
+    ro.fill_cache = !no_block_cache;
+    db_->MultiGet(ro, db_->DefaultColumnFamily(), kNumKeys, keys.data(),
+                  values.data(), statuses.data());
+    SetPerfLevel(PerfLevel::kDisable);
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(statuses[i]);
+      ASSERT_EQ(value_strs[i], values[i].ToString());
+    }
+    ASSERT_EQ(kNumKeys, get_perf_context()->block_read_count);
+    ASSERT_GT(get_perf_context()->block_read_time, 0);
+    ASSERT_GT(get_perf_context()->block_decompress_time, 0);
+  }
+}
+
 TEST_F(DBBasicTest, MultiGetWithSnapshotsAndPersistedTier) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
